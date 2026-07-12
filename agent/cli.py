@@ -34,7 +34,7 @@ def selfcheck() -> int:
     except Exception as e:  # noqa
         print(f"[FAIL] 主循环：{e}"); ok = False
 
-    print("== 自检", "通过 ✅" if ok else "未通过 ❌", "==")
+    print("== 自检", "[PASS]" if ok else "[FAIL]", "==")
     print("\n下一步：按 dayNN 的 lab-guide 填 # TODO 标记。")
     return 0 if ok else 1
 
