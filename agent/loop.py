@@ -78,6 +78,57 @@ def _is_transient(error: Exception) -> bool:
                                     "503", "502", "429"))
 
 
+def _find_last_detailed_assistant(messages: list[dict[str, Any]]) -> str | None:
+    """从消息历史中找最后一条有实质内容的 assistant 消息。
+
+    当模型最终输出太短时（例如只说"完成了"），回溯历史找它之前
+    可能已经生成过的详细分析文本。阈值：至少 300 字符或含 Markdown 标记。
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) >= 300 or any(h in content for h in ["##", "###", "**", "---"]):
+            return content
+    return None
+
+
+def _was_teacher_search_used(messages: list[dict[str, Any]]) -> bool:
+    """检查消息历史中是否调用过 teacher_search 工具。"""
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for tc in (msg.get("tool_calls") or []):
+                if tc.get("name") == "teacher_search":
+                    return True
+        # 也检查 tool 消息（以防 assistant tool_calls 被压缩）
+        if msg.get("role") == "tool" and msg.get("name") == "teacher_search":
+            return True
+    return False
+
+
+def _looks_like_checklist_only(content: str) -> bool:
+    """检测最终输出是否只是一个进度清单，而非真正的评价报告。
+
+    特征：有 ✅ 标记、有"已完成 N/M"模式、但没有 @引用@ 标签。
+    这种输出说明模型偷懒了——它汇报了"做了什么"而不是"发现了什么"。
+    """
+    stripped = content.strip()
+    # 包含完成清单特征
+    has_checklist = (
+        "✅" in stripped
+        and ("已完成" in stripped or "完成总结" in stripped)
+    )
+    # 缺少引用标签（真正的评价报告应该有 @N+关键词@）
+    has_citations = "@" in stripped and any(
+        c.isdigit() for c in stripped.split("@")[1] if stripped.count("@") >= 2
+    ) if "@" in stripped else False
+    # 太短（清单通常很短，而真实评价报告会很长）
+    is_short = len(stripped) < 800
+    return has_checklist and (not has_citations or is_short)
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -212,14 +263,35 @@ class AgentLoop:
                 _recent_call_sigs.clear()
                 if planner.all_done():
                     content = assistant.get("content", "")
-                    # 兜底：如果模型最终输出太短，从 planner 已完成项的 result 中重建
+                    # ── ① 超短输出检测 ──
                     if len(content) < 300 and not any(h in content for h in ["##", "###", "**", "---"]):
-                        todo_summaries = []
-                        for item in planner.list():
-                            if item.status == TodoStatus.COMPLETED and item.result and len(item.result) > 20:
-                                todo_summaries.append(item.result)
-                        if todo_summaries:
-                            content = "\n\n---\n\n".join(todo_summaries)
+                        detailed = _find_last_detailed_assistant(messages)
+                        if detailed:
+                            return detailed
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "你刚才只写了一句简短的完成声明，但还没有把实际的详细总结输出给我。\n\n"
+                                "请根据之前收集到的所有数据，直接输出一份完整的总结报告，包含：\n"
+                                "- 每门课程的授课教师\n"
+                                "- 每位教师的评价摘要（含学生评价要点）\n"
+                                "- 引用标签（@序号+关键词@）\n\n"
+                                "现在就写，不要再调用任何工具。"
+                            ),
+                        })
+                        continue
+                    # ── ② 清单式输出检测：模型写了「已完成 X/Y」清单但没有实际评价内容 ──
+                    if _was_teacher_search_used(messages) and _looks_like_checklist_only(content):
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "你只输出了一份任务完成清单（「已完成 N 项」），但用户需要看到的是**每门课每位教师的具体评价内容**。\n\n"
+                                "请根据之前 teacher_search 返回的所有数据，逐门课、逐位教师写出详细总结，"
+                                "包含每位教师的教学风格、作业量、考试难度、给分情况，并使用 @序号+关键词@ 格式精确引用。\n\n"
+                                "⚠️ 不要再写「任务完成清单」，直接写评价报告正文。现在就写。"
+                            ),
+                        })
+                        continue
                     return content
                 # 还有未完成的待办 → 提示继续
                 pending = planner.pending_or_in_progress()
@@ -235,13 +307,35 @@ class AgentLoop:
                     messages.append({"role": "user", "content": nudge})
                     continue
                 content = assistant.get("content", "")
+                # ── ① 超短输出检测 ──
                 if len(content) < 300 and not any(h in content for h in ["##", "###", "**", "---"]):
-                    todo_summaries = []
-                    for item in planner.list():
-                        if item.status == TodoStatus.COMPLETED and item.result and len(item.result) > 20:
-                            todo_summaries.append(item.result)
-                    if todo_summaries:
-                        content = "\n\n---\n\n".join(todo_summaries)
+                    detailed = _find_last_detailed_assistant(messages)
+                    if detailed:
+                        return detailed
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "你刚才只写了一句简短的完成声明，但还没有把实际的详细总结输出给我。\n\n"
+                            "请根据之前收集到的所有数据，直接输出一份完整的总结报告，包含：\n"
+                            "- 每门课程的授课教师\n"
+                            "- 每位教师的评价摘要（含学生评价要点）\n"
+                            "- 引用标签（@序号+关键词@）\n\n"
+                            "现在就写，不要再调用任何工具。"
+                        ),
+                    })
+                    continue
+                # ── ② 清单式输出检测 ──
+                if _was_teacher_search_used(messages) and _looks_like_checklist_only(content):
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "你只输出了一份任务完成清单（「已完成 N 项」），但用户需要看到的是**每门课每位教师的具体评价内容**。\n\n"
+                            "请根据之前 teacher_search 返回的所有数据，逐门课、逐位教师写出详细总结，"
+                            "包含每位教师的教学风格、作业量、考试难度、给分情况，并使用 @序号+关键词@ 格式精确引用。\n\n"
+                            "⚠️ 不要再写「任务完成清单」，直接写评价报告正文。现在就写。"
+                        ),
+                    })
+                    continue
                 return content
 
             # ── 重复调用检测 ──
@@ -467,15 +561,39 @@ class AgentLoop:
                 _recent_call_sigs.clear()
                 if planner.all_done():
                     content = assistant.get("content", "")
-                    # 兜底：如果模型最终输出太短（仅写"已完成"而无实际评价），
-                    # 尝试从 planner 已完成项的 result 字段中重建总结
+                    # ── ① 超短输出检测 ──
                     if len(content) < 300 and not any(h in content for h in ["##", "###", "**", "---"]):
-                        todo_summaries = []
-                        for item in planner.list():
-                            if item.status == TodoStatus.COMPLETED and item.result and len(item.result) > 20:
-                                todo_summaries.append(item.result)
-                        if todo_summaries:
-                            content = "\n\n---\n\n".join(todo_summaries)
+                        detailed = _find_last_detailed_assistant(messages)
+                        if detailed:
+                            yield ("done", {
+                                "content": detailed,
+                                "messages": messages,
+                            })
+                            return
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "你刚才只写了一句简短的完成声明，但还没有把实际的详细总结输出给我。\n\n"
+                                "请根据之前收集到的所有数据，直接输出一份完整的总结报告，包含：\n"
+                                "- 每门课程的授课教师\n"
+                                "- 每位教师的评价摘要（含学生评价要点）\n"
+                                "- 引用标签（@序号+关键词@）\n\n"
+                                "现在就写，不要再调用任何工具。"
+                            ),
+                        })
+                        continue
+                    # ── ② 清单式输出检测 ──
+                    if _was_teacher_search_used(messages) and _looks_like_checklist_only(content):
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "你只输出了一份任务完成清单（\"已完成 N 项\"），但用户需要看到的是**每门课每位教师的具体评价内容**。\n\n"
+                                "请根据之前 teacher_search 返回的所有数据，逐门课、逐位教师写出详细总结，"
+                                "包含每位教师的教学风格、作业量、考试难度、给分情况，并使用 @序号+关键词@ 格式精确引用。\n\n"
+                                "⚠️ 不要再写\"任务完成清单\"，直接写评价报告正文。现在就写。"
+                            ),
+                        })
+                        continue
                     yield ("done", {
                         "content": content,
                         "messages": messages,
@@ -494,13 +612,39 @@ class AgentLoop:
                     messages.append({"role": "user", "content": nudge})
                     continue
                 content = assistant.get("content", "")
+                # ── ① 超短输出检测 ──
                 if len(content) < 300 and not any(h in content for h in ["##", "###", "**", "---"]):
-                    todo_summaries = []
-                    for item in planner.list():
-                        if item.status == TodoStatus.COMPLETED and item.result and len(item.result) > 20:
-                            todo_summaries.append(item.result)
-                    if todo_summaries:
-                        content = "\n\n---\n\n".join(todo_summaries)
+                    detailed = _find_last_detailed_assistant(messages)
+                    if detailed:
+                        yield ("done", {
+                            "content": detailed,
+                            "messages": messages,
+                        })
+                        return
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "你刚才只写了一句简短的完成声明，但还没有把实际的详细总结输出给我。\n\n"
+                            "请根据之前收集到的所有数据，直接输出一份完整的总结报告，包含：\n"
+                            "- 每门课程的授课教师\n"
+                            "- 每位教师的评价摘要（含学生评价要点）\n"
+                            "- 引用标签（@序号+关键词@）\n\n"
+                            "现在就写，不要再调用任何工具。"
+                        ),
+                    })
+                    continue
+                # ── ② 清单式输出检测 ──
+                if _was_teacher_search_used(messages) and _looks_like_checklist_only(content):
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "你只输出了一份任务完成清单（\"已完成 N 项\"），但用户需要看到的是**每门课每位教师的具体评价内容**。\n\n"
+                            "请根据之前 teacher_search 返回的所有数据，逐门课、逐位教师写出详细总结，"
+                            "包含每位教师的教学风格、作业量、考试难度、给分情况，并使用 @序号+关键词@ 格式精确引用。\n\n"
+                            "⚠️ 不要再写\"任务完成清单\"，直接写评价报告正文。现在就写。"
+                        ),
+                    })
+                    continue
                 yield ("done", {
                     "content": content,
                     "messages": messages,

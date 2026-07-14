@@ -43,12 +43,29 @@ def selfcheck() -> int:
     return 0 if ok else 1
 
 
-def interactive(backend, registry, system_prompt, tracer=None) -> int:
+def _postprocess_result(result: str, show_all: bool = False) -> str:
+    """对模型输出进行引用安全后处理（仅在教师评价数据存在时生效）。"""
+    import os as _os, sys as _sys
+    _skill_dir = _os.path.join(_os.path.dirname(__file__), "..", "skills", "teacher-eval-search")
+    _skill_dir = _os.path.abspath(_skill_dir)
+    if _skill_dir not in _sys.path:
+        _sys.path.insert(0, _skill_dir)
+
+    try:
+        from search_engine import get_engine  # noqa: E402
+        from safety import postprocess_citations  # noqa: E402
+        engine = get_engine()
+        return postprocess_citations(result, engine, show_all=show_all)
+    except Exception:
+        return result  # 无教师数据目录或模块不可用 → 原样输出
+
+
+def interactive(backend, registry, system_prompt, tracer=None, show_all: bool = False) -> int:
     """交互式 REPL 模式——类似 Claude Code 的持续对话体验。"""
     # 管道/重定向场景下不使用 Rich（避免编码问题）
     import sys as _sys
     if not _sys.stdin.isatty():
-        return _interactive_plain(backend, registry, system_prompt, tracer)
+        return _interactive_plain(backend, registry, system_prompt, tracer, show_all=show_all)
 
     try:
         from rich.console import Console
@@ -56,7 +73,7 @@ def interactive(backend, registry, system_prompt, tracer=None) -> int:
         from rich.panel import Panel
     except ImportError:
         # Fallback: plain text REPL without Rich formatting
-        return _interactive_plain(backend, registry, system_prompt, tracer)
+        return _interactive_plain(backend, registry, system_prompt, tracer, show_all=show_all)
 
     # ── 输入层：优先使用 prompt_toolkit（跨平台终端输入支持好）──
     try:
@@ -209,6 +226,7 @@ def interactive(backend, registry, system_prompt, tracer=None) -> int:
                     messages = data.get("messages")
                     console.print(" " * 30)  # 清掉 "思考中..." 行
                     if content:
+                        content = _postprocess_result(content, show_all=show_all)
                         console.print(Markdown(content))
                     console.print()
 
@@ -222,7 +240,7 @@ def interactive(backend, registry, system_prompt, tracer=None) -> int:
     return 0
 
 
-def _interactive_plain(backend, registry, system_prompt, tracer=None) -> int:
+def _interactive_plain(backend, registry, system_prompt, tracer=None, show_all: bool = False) -> int:
     """Rich 不可用时的纯文本回退 REPL。"""
     print("\nmini-OpenClaw 交互模式（纯文本）")
     print("输入任务开始，/exit 退出，/clear 清空，/help 帮助\n")
@@ -276,6 +294,7 @@ def _interactive_plain(backend, registry, system_prompt, tracer=None) -> int:
                     messages = data.get("messages")
                     print()
                     if content:
+                        content = _postprocess_result(content, show_all=show_all)
                         print(content)
                     print()
                 elif event_type == "error":
@@ -358,8 +377,17 @@ def main(argv: list[str] | None = None) -> int:
 
         # ── 交互模式（无任务参数时进入 REPL）──
         if not args.task:
+            # 交互模式下额外注入引用规则提醒，强化原封不动引用原文的要求
+            _citation_reminder = (
+                "\n\n"
+                "## ⚠️ 交互模式特别提醒：引用规则（每次输出评价前请自查）\n"
+                "- **@引用标签中的关键词必须是原评论中逐字复制（Ctrl+C）的连续文本，不得做任何改写、概括、近义替换或添加修饰词。**\n"
+                "- 自查方法：打开原始评价原文 → 找到你要引用的那句话 → 选中一个连续短语 → 原样粘贴到 @序号+关键词@ 中。\n"
+                "- 常见翻车案例：原文\"老师人很好\" → 你写\"老师很友好\" ❌ | 原文\"讲得清晰\" → 你写\"讲得非常清晰\" ❌ | 原文\"给分不错\" → 你写\"给分好\" ❌\n"
+                "- 如果某个观点没有原文能精确支撑，宁可标注\"暂无相关评价\"也不可自行编造引用。\n"
+            )
             try:
-                return interactive(backend, reg, system, tracer)
+                return interactive(backend, reg, system + _citation_reminder, tracer, show_all=args.show_all)
             finally:
                 # 安全：确保 MCP 子进程被清理
                 if echo_mcp is not None:
@@ -379,19 +407,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[可观测] 轨迹已保存至 {_trace_path}（可通过 eval.tracer.replay 回放）")
 
         # ── 引用安全后处理（仅在教师评价数据存在时生效） ──
-        # 将 skills/teacher-eval-search 加入 sys.path（teacher_search.py 做过同样的操作）
-        _skill_dir = os.path.join(os.path.dirname(__file__), "..", "skills", "teacher-eval-search")
-        _skill_dir = os.path.abspath(_skill_dir)
-        if _skill_dir not in sys.path:
-            sys.path.insert(0, _skill_dir)
-
-        try:
-            from search_engine import get_engine  # noqa: E402
-            from safety import postprocess_citations  # noqa: E402
-            engine = get_engine()
-            result = postprocess_citations(result, engine, show_all=args.show_all)
-        except Exception:
-            pass  # 无教师数据目录或模块不可用 → 原样输出
+        result = _postprocess_result(result, show_all=args.show_all)
 
         # 使用 rich 在终端中渲染 Markdown，让输出更美观
         # 先清理可能存在的 surrogate 字符（来自原始数据），防止编码崩溃

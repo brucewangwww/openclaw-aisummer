@@ -1,0 +1,23 @@
+# Git
+.git/
+.gitignore
+
+# Agent traces & memory
+.agent_traces/
+.agent_memory/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Claude
+.claude/
+
+# Misc
+*.txt
+!requirements.txt
+README.md
+CLAUDE.md
+report.md
